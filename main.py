@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -11,6 +11,9 @@ import os
 import json
 import base64
 from dotenv import load_dotenv
+
+from realtime_ai import RealtimePipeline
+from realtime_ai.pipeline import PipelineConfig, PipelineEvent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1355,4 +1358,174 @@ async def upload_multiple_images(files: List[UploadFile] = File(...)):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy"} 
+    return {"status": "healthy"}
+
+
+# ---------------------------------------------------------------------------
+# Real-time AI multi-speaker discussion endpoints
+# ---------------------------------------------------------------------------
+
+# One shared pipeline instance per application process.
+_discussion_pipeline: Optional[RealtimePipeline] = None
+
+
+def _get_pipeline() -> RealtimePipeline:
+    """Return (or lazily create) the shared pipeline instance."""
+    global _discussion_pipeline
+    if _discussion_pipeline is None:
+        _discussion_pipeline = RealtimePipeline(
+            PipelineConfig(tts_backend="mock")  # use mock TTS in default server mode
+        )
+    return _discussion_pipeline
+
+
+@app.post("/discussion/text", summary="Inject a text turn into the discussion")
+async def discussion_feed_text(
+    speaker_id: str = Form(..., description="Speaker identifier, e.g. 'Mr_Q'"),
+    text: str = Form(..., description="Utterance text"),
+) -> Dict[str, Any]:
+    """
+    Feed a pre-transcribed speaker utterance into the real-time discussion
+    pipeline.  Returns an AI response when a trigger fires, or an
+    acknowledgement otherwise.
+    """
+    pipeline = _get_pipeline()
+    event: Optional[PipelineEvent] = pipeline.feed_text(speaker_id, text)
+    if event is not None:
+        return {
+            "status": "response_generated",
+            "ai_response": event.text,
+            "trigger_type": event.response.trigger_type.name if event.response else None,
+            "attributions": event.response.speaker_attributions if event.response else [],
+            "latency_ms": event.response.latency_ms if event.response else 0,
+        }
+    return {"status": "stored", "speaker_id": speaker_id, "text": text}
+
+
+@app.get("/discussion/history", summary="Retrieve recent conversation history")
+async def discussion_history(n: int = 20) -> Dict[str, Any]:
+    """Return the last *n* utterances stored in the pipeline memory."""
+    pipeline = _get_pipeline()
+    utterances = pipeline.get_conversation_history(n)
+    return {"count": len(utterances), "utterances": utterances}
+
+
+@app.post("/discussion/reset", summary="Reset the discussion pipeline")
+async def discussion_reset() -> Dict[str, str]:
+    """Clear all conversation memory and speaker models."""
+    pipeline = _get_pipeline()
+    pipeline.reset()
+    return {"status": "reset"}
+
+
+@app.websocket("/discussion/ws")
+async def discussion_websocket(websocket: WebSocket) -> None:
+    """
+    WebSocket endpoint for real-time multi-speaker audio streaming.
+
+    **Protocol**
+
+    * **Text frames** – JSON objects: ``{"speaker_id": "...", "text": "..."}``.
+      Injected directly as pre-transcribed turns.
+    * **Binary frames** – raw PCM 16-bit mono audio at 16 kHz.  Processed
+      through the full diarization → ASR → reasoning pipeline.
+
+    **Server pushes** – JSON objects describing pipeline events::
+
+        {"event": "asr_partial", "speaker_id": "...", "text": "..."}
+        {"event": "asr_final",   "speaker_id": "...", "text": "..."}
+        {"event": "trigger",     "speaker_id": "...", "text": "..."}
+        {"event": "response",    "speaker_id": "AI",  "text": "...", "attributions": [...]}
+    """
+    await websocket.accept()
+    pipeline = _get_pipeline()
+    logger.info("WebSocket discussion session opened")
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if "text" in message:
+                # Pre-transcribed text turn
+                try:
+                    payload = json.loads(message["text"])
+                except (json.JSONDecodeError, TypeError):
+                    await websocket.send_json({"error": "Invalid JSON payload"})
+                    continue
+
+                speaker_id = payload.get("speaker_id", "Unknown")
+                text = payload.get("text", "")
+                if not text:
+                    await websocket.send_json({"error": "Empty text"})
+                    continue
+
+                await websocket.send_json({
+                    "event": "asr_final",
+                    "speaker_id": speaker_id,
+                    "text": text,
+                })
+
+                event = pipeline.feed_text(speaker_id, text)
+                if event:
+                    await websocket.send_json({
+                        "event": "response",
+                        "speaker_id": "AI",
+                        "text": event.text,
+                        "attributions": event.response.speaker_attributions if event.response else [],
+                        "trigger_type": event.response.trigger_type.name if event.response else None,
+                        "latency_ms": event.response.latency_ms if event.response else 0,
+                    })
+
+            elif "bytes" in message:
+                # Raw PCM audio chunk
+                raw: bytes = message["bytes"]
+                frames = pipeline.chunker.feed(raw)
+                for frame in frames:
+                    segment = pipeline.diarizer.process(frame)
+                    speaker_id = segment.speaker_id
+
+                    if segment.is_silence:
+                        trigger = pipeline.trigger_detector.feed_frame(
+                            frame, speaker_id
+                        )
+                        if trigger:
+                            event = pipeline.handle_trigger(trigger)
+                            if event:
+                                await websocket.send_json({
+                                    "event": "response",
+                                    "speaker_id": "AI",
+                                    "text": event.text,
+                                    "attributions": event.response.speaker_attributions if event.response else [],
+                                    "trigger_type": event.response.trigger_type.name if event.response else None,
+                                    "latency_ms": event.response.latency_ms if event.response else 0,
+                                })
+                        continue
+
+                    partial = pipeline.asr.feed(frame, speaker_id=speaker_id)
+                    if partial:
+                        await websocket.send_json({
+                            "event": "asr_partial",
+                            "speaker_id": speaker_id,
+                            "text": partial.text,
+                        })
+                        trigger = pipeline.trigger_detector.feed_asr(partial)
+                        if trigger:
+                            event = pipeline.handle_trigger(trigger)
+                            if event:
+                                await websocket.send_json({
+                                    "event": "response",
+                                    "speaker_id": "AI",
+                                    "text": event.text,
+                                    "attributions": event.response.speaker_attributions if event.response else [],
+                                    "trigger_type": event.response.trigger_type.name if event.response else None,
+                                    "latency_ms": event.response.latency_ms if event.response else 0,
+                                })
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket discussion session closed")
+    except Exception as exc:  # pragma: no cover
+        logger.error("WebSocket error: %s", exc)
+        try:
+            await websocket.send_json({"error": str(exc)})
+        except Exception:
+            pass
